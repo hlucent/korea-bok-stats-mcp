@@ -97,28 +97,8 @@ def _extract_ip() -> str:
 
 class RateLimitMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        try:
-            headers = get_http_headers(include_all=True)
-        except Exception as e:
-            headers = {"_error": str(e)}
-
         ip = _extract_ip()
-        current_count = len(_call_log[ip])
-        print(
-            f"[RATE_LIMIT_DEBUG] middleware_id={id(self)} "
-            f"call_log_id={id(_call_log)} ip={ip} "
-            f"current_count_before={current_count} headers={headers}",
-            flush=True,
-        )
-
         allowed, message = check_rate_limit(ip)
-
-        print(
-            f"[RATE_LIMIT_DEBUG] ip={ip} allowed={allowed} "
-            f"count_after={len(_call_log[ip])} message={message!r}",
-            flush=True,
-        )
-
         if not allowed:
             raise RuntimeError(message)
 

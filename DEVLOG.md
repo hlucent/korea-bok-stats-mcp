@@ -72,3 +72,60 @@
 
 ### 아직 미확인
 - 없음 (DEVPLAN.md 4절의 실측 필요 항목 5가지 전부 확인 완료).
+
+---
+
+## 2026-08-17 (배포 후 rate limit 디버깅)
+
+### 증상
+- 사용자가 배포된 서버에 같은 IP로 5회 연속 curl 호출 → 전부 HTTP 200으로 관측,
+  rate limit(1분당 3회 초과 차단)이 작동하지 않는 것으로 의심됨.
+
+### 시도한 것
+1. `_extract_ip()`가 `context.fastmcp_context.get_http_request()`를 호출하고 있었는데,
+   이는 존재하지 않는 API(`Context`에 해당 메서드 없음)라 매 요청 `AttributeError` 발생 후
+   `except Exception`으로 조용히 삼켜짐을 로컬에서 확인. `fastmcp.server.dependencies`의
+   모듈 레벨 함수 `get_http_headers()`/`get_http_request()`를 쓰도록 수정하고,
+   `Fly-Client-IP` 헤더를 우선 사용(없으면 `X-Forwarded-For`)하도록 변경.
+2. 위 수정을 로컬 curl 테스트로 검증 — 동일 IP 5회 연속 호출 시 4번째부터 정상 차단됨을 확인.
+   그러나 사용자가 배포 환경에서 재현했을 때도 여전히 전부 200으로 보임.
+3. `RateLimitMiddleware.on_call_tool`에 임시 디버그 로그(추출된 IP, 누적 카운트,
+   `middleware_id`/`call_log_id`(인스턴스 재생성 여부 확인용), 전체 요청 헤더)를 추가.
+   `fly logs`는 CLAUDE.md가 금지한 명령이라 Claude Code가 직접 실행하지 않고,
+   사용자가 PowerShell에서 직접 실행해 로그를 붙여넣는 방식으로 진행.
+4. 1차 재현 시도: `fly logs`에 `[RATE_LIMIT_DEBUG]` 로그가 전혀 없음 → 확인 결과
+   사용자가 디버그 로그 커밋 이전 버전을 배포한 상태였음. 재배포 요청.
+5. 재배포 후 2차 재현 시도: PowerShell에서 작은따옴표로 감싼 JSON을 curl에 전달했더니
+   따옴표 이스케이핑이 깨져 서버가 `-32700 Parse error`(HTTP 400)로 응답 — 애초에
+   `tools/call`까지 도달하지 못해 미들웨어 자체가 실행되지 않은 것이었음. JSON을
+   파일로 저장 후 `--data-binary @file`로 전달하는 방식으로 변경.
+6. 3차 재현: 올바른 JSON-RPC 요청 5회 연속 전송 후 `fly logs` 확인 결과,
+   `[RATE_LIMIT_DEBUG]`에서 `ip=180.70.169.230`(Fly-Client-IP 헤더에서 정확히 추출됨)
+   기준으로 1~3번째 `allowed=True`, 4~5번째 `allowed=False`로 **정상 차단됨**을 확인.
+   `middleware_id`/`call_log_id`도 5회 요청 내내 동일 — 인스턴스 재생성 문제 없음.
+
+### 확인된 것 (최종 원인)
+- **rate limit 로직 자체는 정상 동작하고 있었다.** 애초의 "5회 전부 200" 관측은
+  MCP(JSON-RPC over HTTP) 프로토콜의 특성 때문이었다: 툴 호출이 rate limit에 걸려
+  차단되어도 **HTTP 상태 코드는 200 OK**로 오고, 대신 JSON-RPC 응답 바디 안에
+  `"isError": true`와 `"Rate limit exceeded..."` 메시지가 담겨서 온다. uvicorn access
+  log(`"POST /mcp HTTP/1.1" 200 OK`)만 보면 차단 여부를 알 수 없음 — 반드시 응답 바디의
+  `isError`/`content.text`를 확인해야 한다.
+- 초기 IP 추출 버그(`get_http_request`가 `Context`에 없는 API였던 점)는 실존하는 버그였고
+  수정이 필요했던 것은 맞지만, 이번 "rate limit 미작동" 증상의 직접 원인은 아니었다
+  (수정 전 코드도 `ip="unknown"`으로나마 전체 클라이언트를 하나의 버킷으로 묶어
+  차단 자체는 동작했을 것으로 추정됨. 다만 IP별 분리가 안 되는 것은 실제 버그였으므로
+  수정 자체는 유효함).
+- 디버깅 중간 단계에서 나온 "재현 안 됨" 두 번은 모두 테스트 방법의 문제였다:
+  (1) 디버그 로그가 아직 배포 안 된 이전 버전으로 테스트, (2) PowerShell 작은따옴표
+  JSON 이스케이핑 오류로 요청 자체가 400으로 실패.
+
+### 조치
+- 디버그 로그는 원인 확정 후 제거하고 원래 코드로 복원.
+- `_extract_ip()`의 `get_http_headers`/`get_http_request` 사용은 그대로 유지
+  (실제로 정상 동작하며 필요한 수정이었음).
+- README.md "알려진 제약사항"에 "차단 시에도 HTTP 200이 오며 응답 바디의 isError로
+  판단해야 한다"는 내용 반영.
+
+### 아직 미확인
+- 없음.
