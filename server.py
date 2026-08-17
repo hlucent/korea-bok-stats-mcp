@@ -6,9 +6,8 @@ from collections import defaultdict
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from bok_api import call_ecos_api, BokApiError
 
@@ -66,24 +65,39 @@ def check_rate_limit(ip: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _extract_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
+def _extract_ip() -> str:
+    """fly.io 프록시 환경에서 클라이언트 IP를 추출한다.
+
+    fly.io는 Fly-Client-IP(가장 신뢰할 수 있는 실제 클라이언트 IP)와
+    X-Forwarded-For를 모두 제공한다. Fly-Client-IP를 우선 사용하고,
+    없으면 X-Forwarded-For, 그마저 없으면 요청의 remote address를 쓴다.
+    """
+    try:
+        headers = get_http_headers()
+    except Exception:
+        headers = {}
+
+    fly_client_ip = headers.get("fly-client-ip")
+    if fly_client_ip:
+        return fly_client_ip.strip()
+
+    forwarded = headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
+
+    try:
+        request = get_http_request()
+        if request.client:
+            return request.client.host
+    except Exception:
+        pass
+
     return "unknown"
 
 
 class RateLimitMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        request: Request | None = None
-        try:
-            request = context.fastmcp_context.get_http_request()
-        except Exception:
-            request = None
-
-        ip = _extract_ip(request) if request is not None else "unknown"
+        ip = _extract_ip()
         allowed, message = check_rate_limit(ip)
         if not allowed:
             raise RuntimeError(message)
